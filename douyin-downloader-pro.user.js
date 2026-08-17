@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.0
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）。
+// @version      0.2.1
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -15,6 +15,8 @@
 // @connect      *
 // @license      MIT
 // @run-at       document-start
+// @updateURL   https://raw.githubusercontent.com/HeWanglan-X/douyin-downloader-pro/main/douyin-downloader-pro.user.js
+// @downloadURL https://raw.githubusercontent.com/HeWanglan-X/douyin-downloader-pro/main/douyin-downloader-pro.user.js
 // Fork of "抖音视频下载（Douyin Downloader）" by ArcherEmiya (https://github.com/W-ArcherEmiya).
 // Differences from the official version:
 //   - Fix: the floating panel's invisible area no longer blocks clicks on Douyin's own UI.
@@ -22,7 +24,8 @@
 //   - Hotkey: same as official ('q') — this fork is meant to REPLACE the official version,
 //     so install only one of them to avoid double-triggering on Q.
 //   - Auto shift: the floating button moves left automatically when the official button is present.
-// Update URLs are intentionally omitted; updates are maintained by the fork owner only.
+// Update source: this GitHub repo (raw.githubusercontent.com). Tampermonkey checks @updateURL
+// periodically; bump @version on every release so the auto-update actually triggers.
 // ==/UserScript==
 
 (function () {
