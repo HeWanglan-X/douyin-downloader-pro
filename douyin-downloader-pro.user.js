@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.1
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）。自动更新源为本仓库 GitHub。
+// @version      0.2.2
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -24,6 +24,7 @@
 //   - Hotkey: same as official ('q') — this fork is meant to REPLACE the official version,
 //     so install only one of them to avoid double-triggering on Q.
 //   - Auto shift: the floating button moves left automatically when the official button is present.
+//   - Localized (v0.2.2): the floating button, status bubble, and batch download dialog are now in Chinese.
 // Update source: this GitHub repo (raw.githubusercontent.com). Tampermonkey checks @updateURL
 // periodically; bump @version on every release so the auto-update actually triggers.
 // ==/UserScript==
@@ -87,7 +88,7 @@
         batchDirectoryName: '',
         batchModalLoading: false,
         batchLoadingMessage: '',
-        toggleLabel: 'Download video',
+        toggleLabel: '下载视频',
         lastStatus: '',
         statusBubbleActive: false,
         statusHideTimer: null,
@@ -744,7 +745,7 @@
             return `${percent}% (${loadedText} / ${formatByteSize(totalValue)})`;
         }
 
-        return `${loadedText} downloaded`;
+        return `${loadedText} 已下载`;
     }
 
     function buildFallbackMeta() {
@@ -780,7 +781,7 @@
 
         const toggle = document.getElementById(PANEL_TOGGLE_ID);
         if (toggle) {
-            const label = state.toggleLabel || 'Download';
+            const label = state.toggleLabel || '下载';
             const title = [label, state.lastStatus].filter(Boolean).join('\n');
             toggle.title = title;
             toggle.setAttribute('aria-label', title);
@@ -852,8 +853,8 @@
         const pickButton = document.getElementById(BATCH_PICK_DIR_ID);
         if (hint) {
             hint.textContent = state.batchDirectoryName
-                ? `Download folder: ${state.batchDirectoryName}`
-                : (isDirectoryPickerSupported() ? 'Download folder: not selected' : 'Download folder: browser not supported');
+                ? `下载文件夹: ${state.batchDirectoryName}`
+                : (isDirectoryPickerSupported() ? '下载文件夹: 未选择' : '下载文件夹: 浏览器不支持');
         }
 
         if (pickButton) {
@@ -863,7 +864,7 @@
 
     async function pickBatchDownloadDirectory() {
         if (!isDirectoryPickerSupported()) {
-            setBatchSummaryMessage('Your browser does not support selecting a batch download folder.');
+            setBatchSummaryMessage('当前浏览器不支持选择批量下载文件夹。');
             return;
         }
 
@@ -882,7 +883,7 @@
             }
 
             console.error('[Douyin Downloader Pro] Failed to pick batch directory.', error);
-            setBatchSummaryMessage(`Folder selection failed: ${error.message}`);
+            setBatchSummaryMessage(`选择文件夹失败: ${error.message}`);
         }
     }
 
@@ -904,7 +905,7 @@
             }
 
             if (permission !== 'granted') {
-                throw new Error('Batch download folder permission was denied');
+                throw new Error('批量下载文件夹权限被拒绝');
             }
         }
 
@@ -964,15 +965,15 @@
 
         if (summary) {
             if (state.batchModalLoading) {
-                summary.textContent = state.batchLoadingMessage || 'Loading video list...';
+                summary.textContent = state.batchLoadingMessage || '正在加载视频列表...';
             } else {
-                summary.textContent = `Detected ${entries.length} videos, showing ${filteredEntries.length}, ${selectableCount} available, ${selectedCount} selected. Current filter: ${filteredSelectableCount} available, ${filteredSelectedCount} selected.`;
+                summary.textContent = `检测到 ${entries.length} 个视频,显示 ${filteredEntries.length} 个,可下载 ${selectableCount} 个,已选择 ${selectedCount} 个。当前筛选:可下载 ${filteredSelectableCount} 个,已选择 ${filteredSelectedCount} 个。`;
             }
         }
 
         if (startButton) {
             startButton.disabled = state.batchModalLoading || selectedCount === 0 || isBusy();
-            startButton.textContent = selectedCount > 0 ? `Download selected (${selectedCount})` : 'Download selected';
+            startButton.textContent = selectedCount > 0 ? `下载所选 (${selectedCount})` : '下载所选';
         }
 
         updateBatchDirectoryHint();
@@ -994,7 +995,7 @@
             spinner.className = `${SCRIPT_ID}-spinner`;
 
             const text = document.createElement('div');
-            text.textContent = state.batchLoadingMessage || 'Loading video list...';
+            text.textContent = state.batchLoadingMessage || '正在加载视频列表...';
 
             loading.appendChild(spinner);
             loading.appendChild(text);
@@ -1007,7 +1008,7 @@
         if (!filteredEntries.length) {
             const empty = document.createElement('div');
             empty.className = `${SCRIPT_ID}-item is-disabled`;
-            empty.textContent = 'No videos match the current search.';
+            empty.textContent = '没有与当前搜索匹配的视频。';
             list.appendChild(empty);
             updateBatchModalSummary();
             return;
@@ -1032,14 +1033,14 @@
             const meta = document.createElement('div');
             meta.className = `${SCRIPT_ID}-item-meta`;
             meta.textContent = [
-                `Author: ${entry.meta.author || AUTHOR_FALLBACK}`,
+                `作者: ${entry.meta.author || AUTHOR_FALLBACK}`,
                 entry.pageUrl,
-                entry.error ? `Error: ${entry.error}` : '',
+                entry.error ? `错误: ${entry.error}` : '',
             ].filter(Boolean).join('\n');
 
             const status = document.createElement('div');
             status.className = `${SCRIPT_ID}-item-status${entry.available ? '' : ' is-error'}`;
-            status.textContent = entry.available ? 'Ready' : 'Unavailable';
+            status.textContent = entry.available ? '可下载' : '不可用';
 
             body.appendChild(title);
             body.appendChild(meta);
@@ -1108,7 +1109,7 @@
     }
 
     function setPrimaryButtonState(label, disabled, mode = 'single') {
-        state.toggleLabel = label || 'Download';
+        state.toggleLabel = label || '下载';
 
         const panel = document.getElementById(PANEL_ID);
         const toggle = document.getElementById(PANEL_TOGGLE_ID);
@@ -2307,19 +2308,19 @@
         const status = Number(context.status) || 0;
 
         if (status && (status < 200 || status >= 300)) {
-            throw new Error(`Video request failed with HTTP ${status}`);
+            throw new Error(`视频请求失败,HTTP ${status}`);
         }
 
         if (!size) {
-            throw new Error('Empty video response');
+            throw new Error('视频响应为空');
         }
 
         if (size < 1024) {
-            throw new Error(`Video response is too small (${size} bytes)`);
+            throw new Error(`视频响应过小(${size} 字节)`);
         }
 
         if (/^(text\/|application\/(?:json|xml)|.*html|.*xml)/i.test(contentType)) {
-            throw new Error(`Video response has unexpected content type: ${contentType || 'unknown'}`);
+            throw new Error(`视频响应内容类型异常: ${contentType || '未知'}`);
         }
     }
 
@@ -2338,7 +2339,7 @@
 
     function gmDownload(url, filename, onProgress) {
         if (typeof GM_download !== 'function') {
-            return Promise.reject(new Error('GM_download is unavailable'));
+            return Promise.reject(new Error('GM_download 不可用'));
         }
 
         return new Promise((resolve, reject) => {
@@ -2359,10 +2360,10 @@
                     });
                 },
                 onerror: (error) => {
-                    reject(new Error(error?.error || 'GM_download failed'));
+                    reject(new Error(error?.error || 'GM_download 失败'));
                 },
                 ontimeout: () => {
-                    reject(new Error('GM_download timeout'));
+                    reject(new Error('GM_download 超时'));
                 },
             });
         });
@@ -2440,7 +2441,7 @@
             const response = await fetch(videoUrl);
             const blob = await response.blob();
             if (!blob.size) {
-                throw new Error('Empty blob response');
+                throw new Error('Blob 响应为空');
             }
 
             triggerBrowserDownload(blob, filename);
@@ -2490,7 +2491,7 @@
             });
 
             if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+                throw new Error(`HTTP 状态码 ${response.status}`);
             }
 
             const total = Number(response.headers.get('content-length')) || 0;
@@ -2506,7 +2507,7 @@
                 }
 
                 if (!blob.size) {
-                    throw new Error('Empty response body');
+                    throw new Error('响应内容为空');
                 }
                 assertUsableVideoBlob(blob, {
                     contentType: response.headers.get('content-type') || blob.type,
@@ -2548,7 +2549,7 @@
                 type: response.headers.get('content-type') || 'video/mp4',
             });
             if (!blob.size) {
-                throw new Error('Empty response body');
+                throw new Error('响应内容为空');
             }
             assertUsableVideoBlob(blob, {
                 contentType: response.headers.get('content-type') || blob.type,
@@ -3079,7 +3080,7 @@
         for (let round = 0; round < 8; round += 1) {
             const { worksCountHint } = findProfileVideoCollectionRoot();
             const currentCount = collectProfileVideoEntries().length;
-            const progressMessage = `Preparing profile page...\nLoaded links: ${currentCount}${worksCountHint ? `/${worksCountHint}` : ''}`;
+            const progressMessage = `正在准备主页...\n已加载链接: ${currentCount}${worksCountHint ? `/${worksCountHint}` : ''}`;
 
             setStatus(progressMessage);
             if (state.batchModalLoading) {
@@ -3903,7 +3904,7 @@
         });
 
         if (!response.ok) {
-            throw new Error(`Page request failed with HTTP ${response.status}`);
+            throw new Error(`页面请求失败,HTTP ${response.status}`);
         }
 
         const htmlText = await response.text();
@@ -3928,15 +3929,15 @@
         );
 
         if (!entry.videoUrl) {
-            throw new Error('Could not find a playable video URL on the page');
+            throw new Error('页面上未找到可播放的视频链接');
         }
 
         if (targetVideoId && resolvedVideoId && resolvedVideoId !== targetVideoId) {
-            throw new Error('Could not match the requested video on the page');
+            throw new Error('页面上未匹配到请求的视频');
         }
 
         if (targetVideoId && !resolvedVideoId && !allowUnknownVideoId) {
-            throw new Error('Could not match the requested video on the page');
+            throw new Error('页面上未匹配到请求的视频');
         }
 
         return {
@@ -3952,7 +3953,7 @@
     async function resolveVideoEntryFromAwemeDetail(videoId) {
         const targetVideoId = normalizeVideoId(videoId);
         if (!targetVideoId) {
-            throw new Error('Missing video ID for aweme detail request');
+            throw new Error('缺少 aweme 详情请求所需的视频 ID');
         }
 
         const cachedBeforeFetch = getStructuredVideoRecord(targetVideoId, '');
@@ -3971,7 +3972,7 @@
                 });
 
                 if (!response.ok) {
-                    throw new Error(`Detail request failed with HTTP ${response.status}`);
+                    throw new Error(`详情请求失败,HTTP ${response.status}`);
                 }
 
                 const rawText = await response.text();
@@ -3985,7 +3986,7 @@
                     return exactRecord;
                 }
 
-                throw new Error('Detail response did not contain a playable URL for the requested video');
+                throw new Error('详情响应中未包含请求视频的可播放链接');
             } catch (error) {
                 lastError = error;
                 console.warn('[Douyin Downloader Pro] Aweme detail resolution failed, trying next endpoint.', error);
@@ -4061,7 +4062,7 @@
             };
         }
 
-        throw new Error('Could not resolve the current recommendation video from the active player');
+        throw new Error('无法从当前播放器中解析推荐视频');
     }
 
     async function resolveCurrentVideoEntry() {
@@ -4346,7 +4347,7 @@
         }
 
         if (feedStylePage && activeVideoId) {
-            throw new Error('Could not resolve the current feed video without using a neighbor preload');
+            throw new Error('无法在不使用相邻预加载的情况下解析当前推荐视频');
         }
 
         const videoPageUrl = normalizeVideoPageUrl(location.href) || location.href;
@@ -4398,7 +4399,7 @@
 
         const initialMeta = video ? extractMetaFromVideo(video) : buildFallbackMeta();
 
-        beginAction('single', 'Preparing video download', `Preparing download:\n${initialMeta.title}`);
+        beginAction('single', '准备下载视频', `正在准备下载:\n${initialMeta.title}`);
 
         try {
             const entry = await resolveCurrentVideoEntry();
@@ -4409,18 +4410,18 @@
                 const percent = progress?.total
                     ? Math.max(0, Math.min(100, Math.round(((progress.loaded || 0) / progress.total) * 100)))
                     : 0;
-                const label = percent > 0 ? `Downloading ${percent}%` : 'Downloading video';
+                const label = percent > 0 ? `正在下载 ${percent}%` : '正在下载视频';
 
                 setPrimaryButtonState(label, true, 'single');
                 setStatus([
-                    `Downloading from ${entry.source}:`,
+                    `正在从 ${entry.source} 下载:`,
                     entry.meta.title,
                     progressText,
                 ].join('\n'));
             };
 
-            setPrimaryButtonState('Starting download', true, 'single');
-            setStatus(`Starting download:\n${entry.meta.title}`);
+            setPrimaryButtonState('开始下载', true, 'single');
+            setStatus(`开始下载:\n${entry.meta.title}`);
             const candidateUrls = Array.from(new Set([
                 entry.videoUrl,
                 ...(Array.isArray(entry.alternateUrls) ? entry.alternateUrls : []),
@@ -4430,7 +4431,7 @@
             for (let index = 0; index < candidateUrls.length; index += 1) {
                 try {
                     if (index > 0) {
-                        setStatus(`Trying alternate video URL ${index + 1}/${candidateUrls.length}:\n${entry.meta.title}`);
+                        setStatus(`正在尝试备用视频链接 ${index + 1}/${candidateUrls.length}:\n${entry.meta.title}`);
                     }
 
                     await downloadVideoUrl(candidateUrls[index], filename, updateSingleDownloadProgress);
@@ -4446,10 +4447,10 @@
                 throw lastDownloadError;
             }
 
-            setStatus(`Saved:\n${filename}`);
+            setStatus(`已保存:\n${filename}`);
         } catch (error) {
             console.error('[Douyin Downloader Pro] Download failed.', error);
-            setStatus(`Download failed:\n${error.message}`);
+            setStatus(`下载失败:\n${error.message}`);
         } finally {
             finishAction();
         }
@@ -4469,7 +4470,7 @@
             currentEntries.forEach((entry) => {
                 seen.set(entry.pageUrl, entry);
             });
-            const progressMessage = `Scanning profile page...\nLoaded links: ${seen.size}${worksCountHint ? `/${worksCountHint}` : ''}`;
+            const progressMessage = `正在扫描主页...\n已加载链接: ${seen.size}${worksCountHint ? `/${worksCountHint}` : ''}`;
             setStatus(progressMessage);
             if (state.batchModalLoading) {
                 setBatchModalLoading(true, progressMessage);
@@ -4518,8 +4519,8 @@
             const pageUrl = typeof linkEntry === 'string' ? linkEntry : linkEntry.pageUrl;
             const videoId = typeof linkEntry === 'string' ? extractVideoId(linkEntry) : (linkEntry.videoId || extractVideoId(linkEntry.pageUrl));
             const domMeta = typeof linkEntry === 'string' ? {} : (linkEntry.meta || {});
-            const progressMessage = `Preparing batch list...\n${index + 1}/${links.length}\n${pageUrl}`;
-            setPrimaryButtonState(`Scanning ${index + 1}/${links.length}`, true, 'batch');
+            const progressMessage = `正在准备批量列表...\n${index + 1}/${links.length}\n${pageUrl}`;
+            setPrimaryButtonState(`正在扫描 ${index + 1}/${links.length}`, true, 'batch');
             setStatus(progressMessage);
             if (state.batchModalLoading) {
                 setBatchModalLoading(true, progressMessage);
@@ -4547,7 +4548,7 @@
                     videoUrl: '',
                     videoId: videoId || extractVideoId(pageUrl),
                     meta: chooseBetterMeta(domMeta, {
-                        title: `Video ${index + 1}`,
+                        title: `视频 ${index + 1}`,
                         author: AUTHOR_FALLBACK,
                     }),
                     available: Boolean(pageUrl),
@@ -4574,7 +4575,7 @@
         }
 
         closeBatchModal();
-        beginAction('batch', `Batch 0/${selectedEntries.length}`, `Preparing selected batch...\n${selectedEntries.length} videos queued.`);
+        beginAction('batch', `批量 0/${selectedEntries.length}`, `正在准备所选批量下载...\n已加入队列 ${selectedEntries.length} 个视频。`);
 
         try {
             let successCount = 0;
@@ -4583,8 +4584,8 @@
 
             for (let index = 0; index < selectedEntries.length; index += 1) {
                 const selectedEntry = selectedEntries[index];
-                setPrimaryButtonState(`Batch ${index + 1}/${selectedEntries.length}`, true, 'batch');
-                setStatus(`Preparing ${index + 1}/${selectedEntries.length}...\n${selectedEntry.meta.title}`);
+                setPrimaryButtonState(`批量 ${index + 1}/${selectedEntries.length}`, true, 'batch');
+                setStatus(`正在准备 ${index + 1}/${selectedEntries.length}...\n${selectedEntry.meta.title}`);
 
                 try {
                     let entry = selectedEntry;
@@ -4600,7 +4601,7 @@
                         };
                     }
 
-                    setStatus(`Downloading ${index + 1}/${selectedEntries.length}...\n${entry.meta.title}`);
+                    setStatus(`正在下载 ${index + 1}/${selectedEntries.length}...\n${entry.meta.title}`);
                     await downloadVideoUrl(
                         entry.videoUrl,
                         filenameMap.get(entry.id) || buildFilename(entry.meta),
@@ -4610,16 +4611,16 @@
                     successCount += 1;
                 } catch (error) {
                     console.error('[Douyin Downloader Pro] Selected batch item failed.', selectedEntry.pageUrl, error);
-                    setStatus(`Skipped ${index + 1}/${selectedEntries.length}:\n${error.message}`);
+                    setStatus(`已跳过 ${index + 1}/${selectedEntries.length}:\n${error.message}`);
                 }
 
                 await wait(BATCH_DELAY_MS);
             }
 
-            setStatus(`Batch finished.\nDownloaded ${successCount}/${selectedEntries.length} selected videos.`);
+            setStatus(`批量下载完成。\n已成功下载 ${successCount}/${selectedEntries.length} 个所选视频。`);
         } catch (error) {
             console.error('[Douyin Downloader Pro] Selected batch failed.', error);
-            setStatus(`Batch failed:\n${error.message}`);
+            setStatus(`批量下载失败:\n${error.message}`);
         } finally {
             finishAction();
         }
@@ -4631,12 +4632,12 @@
         }
 
         if (!isLikelyProfilePage()) {
-            setStatus('Open a Douyin profile page first, then use batch download.');
+            setStatus('请先打开抖音个人主页,再使用批量下载。');
             refreshUI();
             return;
         }
 
-        beginAction('batch', 'Scanning profile', 'Scanning profile page for video links...');
+        beginAction('batch', '正在扫描主页', '正在扫描主页上的视频链接...');
         closeBatchModal();
         setBatchEntries([]);
         setBatchModalLoading(false);
@@ -4647,19 +4648,19 @@
             await waitForProfileVideoGridReady();
             links = await collectProfileVideoLinksWithAutoScroll();
             if (!links.length) {
-                throw new Error('No profile video links were found on this page');
+                throw new Error('此页面上未找到主页视频链接');
             }
 
             const entries = await buildBatchEntriesFromLinks(links);
             setMode('idle');
-            setStatus(`Batch list ready.\nChoose the videos you want to download.`);
+            setStatus(`批量列表已就绪。\n请选择要下载的视频。`);
             openBatchModal(entries);
             updateBatchDirectoryHint();
             updateBatchModalSummary();
         } catch (error) {
             console.error('[Douyin Downloader Pro] Batch download failed.', error);
             setBatchModalLoading(false);
-            setStatus(`Batch failed:\n${error.message}`);
+            setStatus(`批量下载失败:\n${error.message}`);
         } finally {
             finishAction();
         }
@@ -4699,19 +4700,19 @@
 
         if (video && video.currentSrc) {
             const meta = extractMetaFromVideo(video);
-            lines.push(`Current video: ${meta.title}`);
-            lines.push(`Author: ${meta.author}`);
+            lines.push(`当前视频: ${meta.title}`);
+            lines.push(`作者: ${meta.author}`);
         } else if (videoPageUrl) {
-            lines.push('Current video: detected from video page');
+            lines.push('当前视频: 已从视频页面识别');
         } else {
-            lines.push('Current video: not detected');
+            lines.push('当前视频: 未识别');
         }
 
         if (isLikelyProfilePage()) {
-            lines.push(`Profile videos loaded: ${profileLinks.length}`);
-            lines.push('Batch download will build a selectable list before downloading.');
+            lines.push(`主页视频已加载: ${profileLinks.length}`);
+            lines.push('批量下载会先构建可勾选的视频列表,再执行下载。');
         } else {
-            lines.push('Open a Douyin profile page to enable batch download.');
+            lines.push('打开抖音个人主页即可启用批量下载。');
         }
 
         return lines.join('\n');
@@ -4729,12 +4730,12 @@
         const hasVideoAction = (video && (pickDirectVideoUrl(video) || video.currentSrc)) || videoPageUrl;
 
         if (profileBatchPage) {
-            const label = loadedLinks > 0 ? 'Batch download profile' : 'Scan profile videos';
+            const label = loadedLinks > 0 ? '批量下载主页视频' : '扫描主页视频';
             setPrimaryButtonState(label, false, 'batch');
         } else if (hasVideoAction) {
-            setPrimaryButtonState('Download video', false, 'single');
+            setPrimaryButtonState('下载视频', false, 'single');
         } else {
-            setPrimaryButtonState('No downloadable content', true, 'single');
+            setPrimaryButtonState('没有可下载的内容', true, 'single');
         }
 
         setStatus(buildIdleStatus());
@@ -4754,8 +4755,8 @@
         toggle.id = PANEL_TOGGLE_ID;
         toggle.type = 'button';
         toggle.innerHTML = getToggleIconMarkup();
-        toggle.title = 'Download';
-        toggle.setAttribute('aria-label', 'Download');
+        toggle.title = '下载';
+        toggle.setAttribute('aria-label', '下载');
         toggle.addEventListener('pointerdown', (event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -4780,8 +4781,8 @@
         document.body.appendChild(panel);
         state.panelTop = loadSavedPanelTop();
         applyPanelPosition();
-        setPrimaryButtonState('Download', false, 'single');
-        setStatus('Waiting for Douyin content...');
+        setPrimaryButtonState('下载', false, 'single');
+        setStatus('正在等待抖音页面内容...');
     }
 
     function ensureBatchModal() {
@@ -4803,11 +4804,11 @@
 
         const title = document.createElement('h2');
         title.className = `${SCRIPT_ID}-dialog-title`;
-        title.textContent = 'Batch download list';
+        title.textContent = '批量下载列表';
 
         const subtitle = document.createElement('p');
         subtitle.className = `${SCRIPT_ID}-dialog-subtitle`;
-        subtitle.textContent = 'Select any videos you want to download from this profile.';
+        subtitle.textContent = '从该主页中选择您想下载的视频。';
 
         headText.appendChild(title);
         headText.appendChild(subtitle);
@@ -4816,7 +4817,7 @@
         closeButton.id = BATCH_CLOSE_ID;
         closeButton.type = 'button';
         closeButton.className = `${SCRIPT_ID}-text-button`;
-        closeButton.textContent = 'Close';
+        closeButton.textContent = '关闭';
         closeButton.addEventListener('click', () => {
             closeBatchModal();
         });
@@ -4833,7 +4834,7 @@
         const searchInput = document.createElement('input');
         searchInput.id = BATCH_SEARCH_ID;
         searchInput.type = 'search';
-        searchInput.placeholder = 'Search by title, author, or link';
+        searchInput.placeholder = '按标题、作者或链接搜索';
         searchInput.autocomplete = 'off';
         searchInput.spellcheck = false;
         searchInput.addEventListener('input', (event) => {
@@ -4850,7 +4851,7 @@
 
         const dirHint = document.createElement('div');
         dirHint.id = BATCH_DIR_HINT_ID;
-        dirHint.textContent = isDirectoryPickerSupported() ? 'Download folder: not selected' : 'Download folder: browser not supported';
+        dirHint.textContent = isDirectoryPickerSupported() ? '下载文件夹: 未选择' : '下载文件夹: 浏览器不支持';
         toolbarLeft.appendChild(dirHint);
 
         const toolbarRight = document.createElement('div');
@@ -4860,7 +4861,7 @@
         pickDirButton.id = BATCH_PICK_DIR_ID;
         pickDirButton.type = 'button';
         pickDirButton.className = `${SCRIPT_ID}-text-button`;
-        pickDirButton.textContent = 'Choose folder';
+        pickDirButton.textContent = '选择文件夹';
         pickDirButton.disabled = !isDirectoryPickerSupported();
         pickDirButton.addEventListener('click', () => {
             void pickBatchDownloadDirectory();
@@ -4870,7 +4871,7 @@
         selectAllButton.id = BATCH_SELECT_ALL_ID;
         selectAllButton.type = 'button';
         selectAllButton.className = `${SCRIPT_ID}-text-button`;
-        selectAllButton.textContent = 'Select all';
+        selectAllButton.textContent = '全选';
         selectAllButton.addEventListener('click', () => {
             setAllBatchSelections(true);
         });
@@ -4879,7 +4880,7 @@
         clearAllButton.id = BATCH_CLEAR_ALL_ID;
         clearAllButton.type = 'button';
         clearAllButton.className = `${SCRIPT_ID}-text-button`;
-        clearAllButton.textContent = 'Clear all';
+        clearAllButton.textContent = '全不选';
         clearAllButton.addEventListener('click', () => {
             setAllBatchSelections(false);
         });
@@ -4907,13 +4908,13 @@
 
         const summary = document.createElement('div');
         summary.id = BATCH_MODAL_SUMMARY_ID;
-        summary.textContent = 'Detected 0 videos, 0 available, 0 selected.';
+        summary.textContent = '检测到 0 个视频,0 个可下载,0 个已选择。';
 
         const startButton = document.createElement('button');
         startButton.id = BATCH_START_ID;
         startButton.type = 'button';
         startButton.className = `${SCRIPT_ID}-action-button`;
-        startButton.textContent = 'Download selected';
+        startButton.textContent = '下载所选';
         startButton.addEventListener('click', () => {
             void startSelectedBatchDownload();
         });
@@ -5008,7 +5009,7 @@
         installObservers();
         scheduleRefresh(0);
 
-        console.log('[Douyin Downloader Pro] Ready. Press Q or click the floating download button.');
+        console.log('[Douyin Downloader Pro] 就绪。按 Q 键或点击悬浮下载按钮。');
     }
 
     boot();
