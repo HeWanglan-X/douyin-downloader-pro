@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.1.0
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可与官方版共存安装。
+// @version      0.2.0
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -18,9 +18,11 @@
 // Fork of "抖音视频下载（Douyin Downloader）" by ArcherEmiya (https://github.com/W-ArcherEmiya).
 // Differences from the official version:
 //   - Fix: the floating panel's invisible area no longer blocks clicks on Douyin's own UI.
-//   - Coexistence: unique DOM ids / storage keys / hotkey so both scripts can run side by side.
+//   - Standalone: unique DOM ids / storage keys so it can be installed side by side if needed.
+//   - Hotkey: same as official ('q') — this fork is meant to REPLACE the official version,
+//     so install only one of them to avoid double-triggering on Q.
 //   - Auto shift: the floating button moves left automatically when the official button is present.
-// Update URLs are intentionally omitted so this fork is never auto-updated by the official release.
+// Update URLs are intentionally omitted; updates are maintained by the fork owner only.
 // ==/UserScript==
 
 (function () {
@@ -46,8 +48,9 @@
     const BATCH_CLEAR_ALL_ID = `${SCRIPT_ID}-batch-clear-all`;
     const BATCH_START_ID = `${SCRIPT_ID}-batch-start`;
     const BATCH_CLOSE_ID = `${SCRIPT_ID}-batch-close`;
-    // Fork: 'd' (Download) instead of the official 'q' so the two hotkeys never fire together.
-    const SHORTCUT_KEY = 'd';
+    // Hotkey: same as the official version ('q'). This fork replaces the official version,
+    // so only one of them should be installed (otherwise Q triggers both).
+    const SHORTCUT_KEY = 'q';
     const TITLE_FALLBACK = 'douyin-video';
     const AUTHOR_FALLBACK = 'unknown-author';
     const MAX_NAME_LENGTH = 80;
@@ -5002,7 +5005,7 @@
         installObservers();
         scheduleRefresh(0);
 
-        console.log('[Douyin Downloader Pro] Ready. Press D or click the floating download button.');
+        console.log('[Douyin Downloader Pro] Ready. Press Q or click the floating download button.');
     }
 
     boot();
