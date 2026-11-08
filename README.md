@@ -30,6 +30,18 @@
 
 ## 安装
 
+**一键安装（推荐）**：<https://raw.githubusercontent.com/HeWanglan-X/douyin-downloader-pro/main/douyin-downloader-pro.user.js> —— 用已装脚本管理器的浏览器打开，篡改猴会弹出安装页。
+
+其他渠道：
+
+| 渠道 | 地址 | 说明 |
+|---|---|---|
+| GitHub 主仓库 | 上面的 raw 链接 | 更新最快，`@updateURL` 指向这里 |
+| GitHub Release | <https://github.com/HeWanglan-X/douyin-downloader-pro/releases/latest> | 附带 `douyin-downloader-pro.user.js` 与 `douyin-downloader-pro-<版本>.zip` 发布包 |
+| Greasy Fork / 脚本猫 / OpenUserJS | 上架中，见仓库 Issues 公告 | 同时维护，版本与 GitHub 对齐 |
+
+手动安装：
+
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（或其他支持 `GM_*` API 的油猴扩展）。
 2. 打开油猴管理面板 → 新建脚本，将 `douyin-downloader-pro.user.js` 的内容粘贴进去，保存。
 3. **停用或删除官方版脚本**（避免两个脚本同时响应 `Q` 键）。
