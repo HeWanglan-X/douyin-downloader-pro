@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.6
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址；0.2.6 修正视频页文件名取错推荐视频标题的问题。自动更新源为本仓库 GitHub。
+// @version      0.2.7
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址；0.2.6 修正视频页文件名取错推荐视频标题的问题；0.2.7 下载提速：多镜像测速 + 6 路分片并发。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -42,6 +42,11 @@
 //     without a signature. The page-world side now scrapes `player.config` (url / definition.extraList
 //     / awemeInfo.video.playApi) into an `aweme_detail`-shaped snapshot, so those videos resolve to the
 //     clean `aweme/v1/play` endpoint instead of failing with "未找到可下载地址".
+//   - Speed (v0.2.7): the plain CDN hosts throttle per connection (measured 2.5-4 MB/s single
+//     stream here) while the signed `/aweme/v1/play/` endpoint redirects to a fast edge (~9-11 MB/s).
+//     The script now probes the first candidates (256 KB range), puts reachable/faster mirrors first,
+//     and downloads over 6 parallel `Range:` requests when the server advertises them (measured
+//     ~20 MB/s on a throttled host, ~14 MB/s on the play endpoint). Falls back to a single stream.
 //   - Title fix (v0.2.6): on `/video/<id>` pages the recommendation rail also exposes titles and
 //     `<video>` nodes, so the DOM heuristics could name the file after a neighbouring clip. The
 //     page's own `<title>` and the bridge's `aweme_id`/`desc`/`author` now win; an immediate repeat
@@ -81,7 +86,7 @@
     const MAX_NAME_LENGTH = 80;
     const TITLE_FILENAME_MAX_LENGTH = 28;
     const AUTHOR_FILENAME_MAX_LENGTH = 16;
-    const BATCH_DELAY_MS = 700;
+    const BATCH_DELAY_MS = 200;
     const SCAN_DELAY_MS = 900;
     const ACTION_STATUS_HIDE_DELAY_MS = 1500;
     const ACTION_REFRESH_DELAY_MS = 1700;
@@ -128,6 +133,7 @@
         lastPlayerSnapshot: '',
         lastDownloadFilename: '',
         lastDownloadAt: 0,
+        mediaProbeCache: new Map(),
     };
 
     const titleSelectors = [
@@ -3037,6 +3043,194 @@
         });
     }
 
+    // v0.2.7: speed helpers. Douyin throttles per connection on the plain CDN hosts
+    // (`v11/v26-web.douyinvod.com` measured ~2.5-4 MB/s single stream here) while the signed
+    // `/aweme/v1/play/` endpoint redirects to a fast edge (~9-11 MB/s). So: probe the candidates,
+    // prefer the fastest, and split into range requests when the winner is still slow.
+    const PROBE_BYTES = 256 * 1024;
+    const PROBE_TIMEOUT_MS = 4000;
+    const PROBE_CACHE_MS = 60000;
+    const RANGE_MIN_BYTES = 2 * 1024 * 1024;
+    const RANGE_CONCURRENCY = 6;
+    const RANGE_MIN_CHUNK = 512 * 1024;
+
+    async function probeMediaUrl(url) {
+        if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+            return { ok: false, supportsRange: false, total: 0, mbps: 0 };
+        }
+
+        const cached = state.mediaProbeCache.get(url);
+        if (cached && (Date.now() - cached.time) < PROBE_CACHE_MS) {
+            return cached;
+        }
+
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        const timer = controller ? window.setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS) : null;
+        const startedAt = typeof performance?.now === 'function' ? performance.now() : Date.now();
+
+        try {
+            const response = await fetch(url, {
+                headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
+                credentials: 'include',
+                signal: controller ? controller.signal : undefined,
+            });
+
+            const buffer = await response.arrayBuffer();
+            const now = typeof performance?.now === 'function' ? performance.now() : Date.now();
+            const seconds = Math.max(0.001, (now - startedAt) / 1000);
+            const rangeHeader = response.headers.get('content-range') || '';
+            const totalMatch = rangeHeader.match(/\/(\d+)/);
+            const total = totalMatch
+                ? Number(totalMatch[1])
+                : (Number(response.headers.get('content-length')) || 0);
+
+            const result = {
+                ok: response.ok || response.status === 206,
+                supportsRange: response.status === 206 && total > 0,
+                total,
+                mbps: (buffer.byteLength / 1024 / 1024) / seconds,
+                time: Date.now(),
+            };
+
+            state.mediaProbeCache.set(url, result);
+            return result;
+        } catch (error) {
+            const failed = { ok: false, supportsRange: false, total: 0, mbps: 0, time: Date.now() };
+            state.mediaProbeCache.set(url, failed);
+            return failed;
+        } finally {
+            if (timer) {
+                window.clearTimeout(timer);
+            }
+        }
+    }
+
+    async function rankCandidatesBySpeed(urls) {
+        if (!Array.isArray(urls) || urls.length < 2) {
+            return Array.isArray(urls) ? urls : [];
+        }
+
+        // Only the first few are worth probing; the rest keep their original (scored) order.
+        const head = urls.slice(0, 3);
+        const tail = urls.slice(3);
+        const probed = await Promise.all(head.map(async (url, index) => ({
+            url,
+            index,
+            probe: await probeMediaUrl(url),
+        })));
+
+        const ordered = probed
+            .sort((left, right) => {
+                // A dead or expired mirror must never win, whatever its noisy probe number says.
+                if (left.probe.ok !== right.probe.ok) {
+                    return left.probe.ok ? -1 : 1;
+                }
+
+                const leftScore = left.probe.mbps;
+                const rightScore = right.probe.mbps;
+
+                if (Math.abs(rightScore - leftScore) > 0.4) {
+                    return rightScore - leftScore;
+                }
+
+                return left.index - right.index;
+            })
+            .map((item) => item.url);
+
+        return ordered.concat(tail);
+    }
+
+    async function downloadByRanges(url, filename, onProgress, totalBytes) {
+        const total = Number(totalBytes) || 0;
+        if (!total) {
+            throw new Error('无法确定文件大小');
+        }
+
+        const concurrency = Math.max(2, Math.min(
+            RANGE_CONCURRENCY,
+            Math.ceil(total / RANGE_MIN_CHUNK)
+        ));
+        const chunkSize = Math.ceil(total / concurrency);
+        const parts = new Array(concurrency);
+        let loaded = 0;
+
+        const report = () => {
+            if (typeof onProgress === 'function') {
+                onProgress({ phase: 'downloading', loaded, total });
+            }
+        };
+
+        report();
+
+        let nextIndex = 0;
+        const worker = async () => {
+            while (true) {
+                const index = nextIndex;
+                nextIndex += 1;
+
+                if (index >= concurrency) {
+                    return;
+                }
+
+                const start = index * chunkSize;
+                const end = Math.min(total - 1, start + chunkSize - 1);
+                if (start > end) {
+                    return;
+                }
+
+                const response = await fetch(url, {
+                    headers: { Range: `bytes=${start}-${end}` },
+                    credentials: 'include',
+                });
+
+                if (!response.ok && response.status !== 206) {
+                    throw new Error(`分片请求失败,HTTP ${response.status}`);
+                }
+
+                const reader = response.body && typeof response.body.getReader === 'function'
+                    ? response.body.getReader()
+                    : null;
+
+                if (!reader) {
+                    const buffer = await response.arrayBuffer();
+                    parts[index] = buffer;
+                    loaded += buffer.byteLength;
+                    report();
+                    continue;
+                }
+
+                const chunks = [];
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+
+                    if (value) {
+                        chunks.push(value);
+                        loaded += value.byteLength;
+                        report();
+                    }
+                }
+
+                parts[index] = new Blob(chunks);
+            }
+        };
+
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+        const blob = new Blob(parts.filter(Boolean), { type: 'video/mp4' });
+        if (!blob.size) {
+            throw new Error('分片下载结果为空');
+        }
+
+        if (typeof onProgress === 'function') {
+            onProgress({ phase: 'downloading', loaded: blob.size, total: blob.size });
+        }
+
+        triggerBrowserDownload(blob, filename);
+    }
+
     async function downloadVideoUrl(videoUrl, filename, onProgress, options = {}) {
         const directoryHandle = options.directoryHandle || null;
         const isBlobUrl = typeof videoUrl === 'string' && videoUrl.startsWith('blob:');
@@ -3058,6 +3252,22 @@
 
             triggerBrowserDownload(blob, filename);
             return;
+        }
+
+        if (!isBlobUrl && !directoryHandle) {
+            const probe = await probeMediaUrl(videoUrl);
+
+            // Measured on real files: 6 range requests give ~18 MB/s on a throttled CDN host vs
+            // ~4 MB/s single stream, and ~13.6 MB/s on the signed play endpoint vs ~10 single. So
+            // use ranges whenever the server advertises them, instead of gating on probe speed.
+            if (probe.ok && probe.supportsRange && probe.total >= RANGE_MIN_BYTES) {
+                try {
+                    await downloadByRanges(videoUrl, filename, onProgress, probe.total);
+                    return;
+                } catch (error) {
+                    console.warn('[Douyin Downloader Pro] Chunked download failed, falling back to a single stream.', error);
+                }
+            }
         }
 
         if (!isBlobUrl && !directoryHandle && typeof GM_download === 'function') {
@@ -5118,8 +5328,14 @@
                 return;
             }
 
+            const singleDownloadStartedAt = Date.now();
             const updateSingleDownloadProgress = (progress) => {
-                const progressText = formatDownloadProgress(progress?.loaded || 0, progress?.total || 0);
+                // v0.2.7: show the live throughput so a slow mirror is visible instead of just "loading".
+                const elapsedSeconds = Math.max(0.2, (Date.now() - singleDownloadStartedAt) / 1000);
+                const speedText = (progress && progress.loaded > 0)
+                    ? ` · ${(((progress.loaded / 1024) / 1024) / elapsedSeconds).toFixed(1)} MB/s`
+                    : '';
+                const progressText = formatDownloadProgress(progress?.loaded || 0, progress?.total || 0) + speedText;
                 const percent = progress?.total
                     ? Math.max(0, Math.min(100, Math.round(((progress.loaded || 0) / progress.total) * 100)))
                     : 0;
@@ -5144,15 +5360,17 @@
                 .filter((url) => isDirectHttpVideoUrl(url) || String(url).startsWith('blob:'))
                 .sort((left, right) => Number(isWatermarkedVideoUrl(left)) - Number(isWatermarkedVideoUrl(right)));
             const onlyWatermarkedSource = candidateUrls.length > 0 && candidateUrls.every(isWatermarkedVideoUrl);
+            // v0.2.7: take the fastest reachable mirror first instead of the static score order.
+            const orderedCandidateUrls = await rankCandidatesBySpeed(candidateUrls);
             let lastDownloadError = null;
 
-            for (let index = 0; index < candidateUrls.length; index += 1) {
+            for (let index = 0; index < orderedCandidateUrls.length; index += 1) {
                 try {
                     if (index > 0) {
-                        setStatus(`正在尝试备用视频链接 ${index + 1}/${candidateUrls.length}:\n${entry.meta.title}`);
+                        setStatus(`正在尝试备用视频链接 ${index + 1}/${orderedCandidateUrls.length}:\n${entry.meta.title}`);
                     }
 
-                    await downloadVideoUrl(candidateUrls[index], filename, updateSingleDownloadProgress);
+                    await downloadVideoUrl(orderedCandidateUrls[index], filename, updateSingleDownloadProgress);
                     lastDownloadError = null;
                     state.lastDownloadFilename = filename;
                     state.lastDownloadAt = Date.now();
