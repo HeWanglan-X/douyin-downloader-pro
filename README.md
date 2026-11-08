@@ -21,6 +21,13 @@
 3. **按钮自动避让**：检测到官方版悬浮按钮存在时，本版按钮自动向左偏移，避免两个按钮重叠；未检测到时保持贴边（right 16px）。
 4. **不再被官方版覆盖**：移除了官方 GreasyFork 更新地址，官方发布新版本不会覆盖本分叉的修复；更新由本仓库自行维护。
 
+## 兼容性（Manifest V3）
+
+- Chrome / Edge 138+ 上的篡改猴 5.x 是 Manifest V3 扩展，用户脚本跑在隔离世界（`USER_SCRIPT`）里：对 `window.fetch`、`XMLHttpRequest` 做的补丁**只作用于那个副本，看不到页面自己的请求**，于是出现「悬浮按钮还在，但点下载没反应 / 解析不到地址」。
+- 自 v0.2.4 起，脚本会向页面注入一小段桥接代码（页面世界执行，自动复用页面 `nonce`）：由它接管 `fetch` / XHR 抓取抖音自己的 aweme / feed 响应，再用 `postMessage` 回传给脚本；同时回传 `_ROUTER_DATA`、`RENDER_DATA`、`player` 等页面全局数据的 JSON 快照。
+- 若站点 CSP 拒绝内联注入，桥接会静默失败并回落到同源 `aweme/detail` 接口解析，不影响手动下载。
+- 需要保持扩展详情页里的「允许用户脚本」（Allow User Scripts）开关为开启，否则篡改猴不会注入任何脚本。
+
 ## 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（或其他支持 `GM_*` API 的油猴扩展）。
@@ -45,6 +52,8 @@
 
 | 版本 | 内容 |
 |---|---|
+| **v0.2.4** | 适配 Manifest V3：新增页面世界抓包桥（注入 `<script>`，nonce 感知，postMessage 回传），修复 Chrome/Edge MV3 沙盒下 `fetch` / XHR 补丁抓不到 aweme 响应、点了按钮没反应的问题；页面全局数据（`_ROUTER_DATA` / `player`）同样走桥接快照；CSP 拦截时静默回落到同源 `aweme/detail` 接口。 |
+| **v0.2.3** | 无水印选源：`download_addr` / `config.downloadUrl` 权重由 +420 降到 -460，水印 URL（`watermark=1` / `logo_name=` / `/playwm/`）排到候选末尾，优先 `play_addr` / `bit_rate[].play_addr` 干净流。 |
 | **v0.2.2** | 界面汉化：悬浮按钮、状态提示、批量下载弹窗（标题/按钮/搜索框/列表/统计/错误提示）全部改为简体中文；下载进度与结果提示同步汉化。 |
 | v0.2.1 | 恢复 `@updateURL` / `@downloadURL`，支持通过本仓库自动更新。 |
 | v0.2.0 | 转正为替代版本：快捷键恢复为 `Q`（与官方一致），独立 DOM/存储键，README 改版声明。 |

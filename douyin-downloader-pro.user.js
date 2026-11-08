@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.2
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化。自动更新源为本仓库 GitHub。
+// @version      0.2.4
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -25,6 +25,18 @@
 //     so install only one of them to avoid double-triggering on Q.
 //   - Auto shift: the floating button moves left automatically when the official button is present.
 //   - Localized (v0.2.2): the floating button, status bubble, and batch download dialog are now in Chinese.
+//   - Watermark fix (v0.2.3): the candidate scorer used to reward "download" keys and direct CDN
+//     mp4 links. On Douyin the `download_addr` stream is the watermarked copy (with logo + user id),
+//     so any video that exposed `download_addr` got saved WITH a watermark. Now: watermark URLs
+//     (watermark=1 / logo_name= / /playwm/) are pushed to the very end, `download*` fields are
+//     demoted, and the clean `play_addr` / `bit_rate[].play_addr` streams win.
+//   - MV3 fix (v0.2.4): in Manifest V3 Tampermonkey registers userscripts with
+//     `world: "USER_SCRIPT"`, i.e. an isolated world. Patching `window.fetch` /
+//     `XMLHttpRequest.prototype` there only touches that world's copy and never sees Douyin's own
+//     aweme responses, so the floating button stayed but no playable URL was ever resolved.
+//     A tiny page-world bridge (injected <script>, nonce-aware) now installs the same hooks inside
+//     the page context and relays captured JSON plus `_ROUTER_DATA` / `RENDER_DATA` / `player`
+//     snapshots back over `postMessage`. Falls back silently when a CSP blocks the injection.
 // Update source: this GitHub repo (raw.githubusercontent.com). Tampermonkey checks @updateURL
 // periodically; bump @version on every release so the auto-update actually triggers.
 // ==/UserScript==
@@ -99,6 +111,11 @@
         videoDataRecords: [],
         lastLocationHref: '',
         locationChangedAt: 0,
+        pageBridgeInstalled: false,
+        pageBridgeInjected: false,
+        pageBridgeChannel: '',
+        pageBridgeError: '',
+        pageGlobals: Object.create(null),
     };
 
     const titleSelectors = [
@@ -1210,6 +1227,357 @@
         };
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Manifest V3 page-world capture bridge (v0.2.4).
+    // In MV3 Tampermonkey registers this script with `world: "USER_SCRIPT"`, so every patch applied
+    // to `window.fetch` / `XMLHttpRequest.prototype` above lives in the sandbox only and never sees
+    // the aweme/feed responses Douyin itself receives. The bootstrap below is injected into the page
+    // world, installs the same hooks there, and relays captured JSON plus key page globals
+    // (`_ROUTER_DATA` / `RENDER_DATA` / `player`) back through postMessage.
+    // Injection is best effort: a strict page CSP simply leaves us on the API fallback path.
+    // ---------------------------------------------------------------------------------------------
+    const PAGE_BRIDGE_SOURCE = `${SCRIPT_ID}-bridge`;
+    const PAGE_BRIDGE_HOST_SOURCE = `${SCRIPT_ID}-host`;
+    const PAGE_BRIDGE_PLAYER_GLOBALS = ['player', '__INLINE_PLAYER_DATA__', '__XG_BIG_CARD_QUICK_PLAYER__'];
+    let pageBridgeInjections = 0;
+
+    // Runs inside the PAGE world; arguments are injected verbatim by buildPageBridgeCode().
+    function pageBridgeBootstrap(channel, source, hostSource) {
+        const FLAG = '__douyinDownloaderProBridge';
+        const INTERESTING = /(aweme|detail|feed|post|item|video|comment|recommend)/i;
+        const MAX_TEXT = 12 * 1024 * 1024;
+        const GLOBAL_NAMES = [
+            '_ROUTER_DATA',
+            'RENDER_DATA',
+            '__INITIAL_STATE__',
+            'player',
+            '__INLINE_PLAYER_DATA__',
+            '__XG_BIG_CARD_QUICK_PLAYER__',
+        ];
+
+        function post(type, payload) {
+            try {
+                window.postMessage({ source: source, channel: channel, type: type, payload: payload }, '*');
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        function sameOrigin(url) {
+            try {
+                return new URL(String(url), location.href).origin === location.origin;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        function worthReading(url, contentType) {
+            const text = String(url || '');
+            const type = String(contentType || '').toLowerCase();
+
+            if (!sameOrigin(text)) {
+                return false;
+            }
+
+            return type.indexOf('json') !== -1 || INTERESTING.test(text);
+        }
+
+        function emit(url, text) {
+            if (typeof text !== 'string' || text.length < 40 || text.length > MAX_TEXT) {
+                return;
+            }
+
+            post('json', { url: String(url || ''), text: text });
+        }
+
+        function patchFetch() {
+            const original = window.fetch;
+            if (typeof original !== 'function' || original.__dydlPatched) {
+                return;
+            }
+
+            const patched = function () {
+                const args = arguments;
+                const promise = original.apply(this, args);
+
+                try {
+                    Promise.resolve(promise).then((response) => {
+                        try {
+                            const request = args[0];
+                            const url = typeof request === 'string'
+                                ? request
+                                : (request && request.url) || '';
+                            const headers = response && response.headers;
+                            const contentType = (headers && headers.get && headers.get('content-type')) || '';
+                            const length = Number((headers && headers.get && headers.get('content-length')) || 0);
+
+                            if (length > MAX_TEXT || !worthReading(url, contentType)) {
+                                return;
+                            }
+
+                            response.clone().text().then((text) => {
+                                emit(url, text);
+                            }).catch(() => {});
+                        } catch (error) {
+                            // ignore
+                        }
+                    }).catch(() => {});
+                } catch (error) {
+                    // ignore
+                }
+
+                return promise;
+            };
+
+            patched.__dydlPatched = true;
+
+            try {
+                window.fetch = patched;
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        function patchXhr() {
+            const proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+            if (!proto || (proto.open && proto.open.__dydlPatched)) {
+                return;
+            }
+
+            const originalOpen = proto.open;
+            const originalSend = proto.send;
+
+            const patchedOpen = function (method, url) {
+                try {
+                    this.__dydlUrl = url;
+                } catch (error) {
+                    // ignore
+                }
+
+                return originalOpen.apply(this, arguments);
+            };
+            patchedOpen.__dydlPatched = true;
+
+            const patchedSend = function () {
+                try {
+                    this.addEventListener('load', function () {
+                        try {
+                            const contentType = this.getResponseHeader('content-type') || '';
+                            if (!worthReading(this.__dydlUrl, contentType)) {
+                                return;
+                            }
+
+                            let text = '';
+                            try {
+                                text = this.responseText || '';
+                            } catch (error) {
+                                return;
+                            }
+
+                            emit(this.__dydlUrl, text);
+                        } catch (error) {
+                            // ignore
+                        }
+                    });
+                } catch (error) {
+                    // ignore
+                }
+
+                return originalSend.apply(this, arguments);
+            };
+
+            try {
+                proto.open = patchedOpen;
+            } catch (error) {
+                // ignore
+            }
+
+            try {
+                proto.send = patchedSend;
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        function dumpGlobals() {
+            const payload = {};
+
+            for (const name of GLOBAL_NAMES) {
+                try {
+                    const value = window[name];
+                    if (!value) {
+                        continue;
+                    }
+
+                    payload[name] = typeof value === 'string' ? value : JSON.stringify(value);
+                } catch (error) {
+                    // ignore circular / unreadable globals
+                }
+            }
+
+            if (Object.keys(payload).length) {
+                post('globals', payload);
+            }
+        }
+
+        patchFetch();
+        patchXhr();
+
+        try {
+            window[FLAG] = { channel: channel, dump: dumpGlobals };
+        } catch (error) {
+            // ignore
+        }
+
+        window.addEventListener('message', (event) => {
+            const data = event && event.data;
+            if (!data || data.source !== hostSource || data.channel !== channel) {
+                return;
+            }
+
+            if (data.type === 'dump') {
+                dumpGlobals();
+            }
+        }, false);
+
+        dumpGlobals();
+    }
+
+    function buildPageBridgeCode(channel) {
+        return `(${pageBridgeBootstrap.toString()})(${JSON.stringify(channel)}, `
+            + `${JSON.stringify(PAGE_BRIDGE_SOURCE)}, ${JSON.stringify(PAGE_BRIDGE_HOST_SOURCE)});\n`
+            + `//# sourceURL=${SCRIPT_ID}-page-bridge.js\n`;
+    }
+
+    function getBridgedPlayerObjects() {
+        const objects = [];
+
+        for (const name of PAGE_BRIDGE_PLAYER_GLOBALS) {
+            const text = state.pageGlobals[name];
+            if (typeof text !== 'string' || !text || text.length > 4 * 1024 * 1024) {
+                continue;
+            }
+
+            try {
+                const parsed = JSON.parse(text);
+                if (parsed && typeof parsed === 'object') {
+                    objects.push(parsed);
+                }
+            } catch (error) {
+                // ignore non-JSON snapshots
+            }
+        }
+
+        return objects;
+    }
+
+    function handlePageBridgeMessage(event) {
+        const data = event && event.data;
+        if (!data || typeof data !== 'object') {
+            return;
+        }
+
+        if (data.source !== PAGE_BRIDGE_SOURCE || data.channel !== state.pageBridgeChannel) {
+            return;
+        }
+
+        if (data.type === 'json') {
+            const text = data.payload && data.payload.text;
+            if (typeof text === 'string' && text.length >= 40) {
+                maybeCacheStructuredDataResponse(text);
+            }
+
+            return;
+        }
+
+        if (data.type === 'globals') {
+            let received = false;
+
+            for (const [name, text] of Object.entries(data.payload || {})) {
+                if (typeof text !== 'string' || !text) {
+                    continue;
+                }
+
+                state.pageGlobals[name] = text;
+                received = true;
+                maybeCacheStructuredDataResponse(text);
+            }
+
+            if (received && document.body) {
+                scheduleRefresh();
+            }
+        }
+    }
+
+    function requestPageGlobals() {
+        if (!state.pageBridgeChannel) {
+            return;
+        }
+
+        try {
+            window.postMessage({
+                source: PAGE_BRIDGE_HOST_SOURCE,
+                channel: state.pageBridgeChannel,
+                type: 'dump',
+            }, '*');
+        } catch (error) {
+            // ignore
+        }
+    }
+
+    function installPageBridge() {
+        if (!state.pageBridgeInstalled) {
+            state.pageBridgeInstalled = true;
+            state.pageBridgeChannel = `${SCRIPT_ID}-${Date.now().toString(36)}`
+                + `-${Math.random().toString(36).slice(2, 10)}`;
+
+            try {
+                window.addEventListener('message', handlePageBridgeMessage, false);
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        const target = document.head || document.documentElement;
+
+        if (state.pageBridgeInjected) {
+            requestPageGlobals();
+            return;
+        }
+
+        if (!target) {
+            if (pageBridgeInjections < 50) {
+                pageBridgeInjections += 1;
+                window.setTimeout(installPageBridge, 20);
+            }
+
+            return;
+        }
+
+        try {
+            const script = document.createElement('script');
+            const nonceHolder = document.querySelector('script[nonce]');
+            const nonce = nonceHolder ? (nonceHolder.nonce || nonceHolder.getAttribute('nonce')) : '';
+
+            if (nonce) {
+                script.setAttribute('nonce', nonce);
+            }
+
+            script.textContent = buildPageBridgeCode(state.pageBridgeChannel);
+            target.appendChild(script);
+            script.remove();
+            state.pageBridgeInjected = true;
+        } catch (error) {
+            if (!state.pageBridgeError) {
+                state.pageBridgeError = String((error && error.message) || error);
+                console.warn(
+                    '[Douyin Downloader Pro] 页面世界注入被拦截(MV3/CSP)，回退到同源 API 解析。',
+                    error
+                );
+            }
+        }
+    }
+
     function cacheMediaUrl(url, source = 'resource') {
         if (!looksLikeVideoUrl(source, url)) {
             return;
@@ -1419,6 +1787,10 @@
 
         state.lastLocationHref = href;
         state.locationChangedAt = typeof performance?.now === 'function' ? performance.now() : Date.now();
+
+        // v0.2.4: SPA navigation swaps the aweme payload behind our back; ask the page-world bridge
+        // for a fresh `_ROUTER_DATA` / player snapshot instead of relying on the sandbox copy.
+        requestPageGlobals();
     }
 
     function scheduleRefresh(delay = REFRESH_DEBOUNCE_MS) {
@@ -1824,12 +2196,15 @@
         return candidates;
     }
 
+    // v0.2.3: when the <video> element advertises several sources, prefer the clean one.
     function pickDirectVideoUrl(video) {
-        return getVideoCandidateUrls(video).find(isDirectHttpVideoUrl) || '';
+        const urls = getVideoCandidateUrls(video).filter(isDirectHttpVideoUrl);
+        return urls.find((url) => !isWatermarkedVideoUrl(url)) || urls[0] || '';
     }
 
     function pickPlayableVideoUrl(video) {
-        return getVideoCandidateUrls(video).find(isPlayableVideoUrl) || '';
+        const urls = getVideoCandidateUrls(video).filter(isPlayableVideoUrl);
+        return urls.find((url) => !isWatermarkedVideoUrl(url)) || urls[0] || '';
     }
 
     function collectObjectVideoUrlCandidates(value, bucket, key = 'url', seen = new WeakSet()) {
@@ -2022,7 +2397,7 @@
 
     function getGlobalPlayerObjects() {
         const pageWindow = getPageWindow();
-        return [
+        const globalObjects = [
             'player',
             'nextPlayer',
             'playerPreloader',
@@ -2036,6 +2411,10 @@
                 return null;
             }
         }).filter((item) => item && typeof item === 'object');
+
+        // v0.2.4: inside the MV3 sandbox `unsafeWindow` is only a limited proxy, so the real player
+        // objects are unreadable. Consume the JSON snapshots the page-world bridge sends instead.
+        return globalObjects.concat(getBridgedPlayerObjects());
     }
 
     function getPagePlayerObject(name = 'player') {
@@ -2117,8 +2496,10 @@
         ].map(normalizeVideoId).find(Boolean) || '';
 
         const urlCandidates = [];
-        collectUrlListVideoUrlCandidates(config?.downloadUrl, urlCandidates, 'config_downloadUrl', 420);
-        collectUrlListVideoUrlCandidates(config?.download_url, urlCandidates, 'config_download_url', 420);
+        // v0.2.3: `config.downloadUrl` is the player's watermarked "save" copy; it used to win with a
+        // +420 bonus and was a second, silent way to get a watermark. Demoted below every play link.
+        collectUrlListVideoUrlCandidates(config?.downloadUrl, urlCandidates, 'config_downloadUrl', -460);
+        collectUrlListVideoUrlCandidates(config?.download_url, urlCandidates, 'config_download_url', -460);
         collectUrlListVideoUrlCandidates(config?.videoUrl, urlCandidates, 'config_videoUrl', 360);
         collectUrlListVideoUrlCandidates(config?.video_url, urlCandidates, 'config_video_url', 360);
         collectUrlListVideoUrlCandidates(config?.url, urlCandidates, 'config_url', 320);
@@ -2235,7 +2616,11 @@
             }
         }
 
-        return candidates
+        // v0.2.3: a watermarked stream is only a last resort.
+        const cleanCandidates = candidates.filter((item) => !isWatermarkedVideoUrl(item.url));
+        const pool = cleanCandidates.length ? cleanCandidates : candidates;
+
+        return pool
             .sort((left, right) => {
                 if (preferRecent) {
                     return right.startTime - left.startTime || right.score - left.score;
@@ -3196,6 +3581,43 @@
         );
     }
 
+    // Watermark detection (v0.2.3).
+    // Douyin burns the logo + author id into the "save / download" copy of a clip. Those streams are
+    // recognisable: the API-style play link carries `&watermark=1&logo_name=...`, and the legacy
+    // endpoint is /aweme/v1/playwm/. The client cannot clean such a stream, so it must rank below
+    // every clean candidate instead of competing with it on the ".mp4 in the URL" heuristic.
+    const WATERMARK_URL_PATTERN = /(?:[?&](?:watermark|wm)=1|[?&]logo_name=|\/playwm\/|\/playwm\?|\/aweme\/v1\/playwm|watermark%3D1)/i;
+    // The server-side play endpoint (`/aweme/v1/play/?video_id=...`) re-signs the stream on demand and
+    // hands back the watermark-free copy, so it is the safest first pick.
+    const CLEAN_PLAY_ENDPOINT_PATTERN = /\/aweme\/v1\/play\/?(?:dash\/)?\?(?:[^#]*&)?video_id=/i;
+    // DASH links point at a video-only stream (no audio track), which would save a silent file.
+    const DASH_STREAM_PATTERN = /\/aweme\/v1\/play\/dash|[/?&]media_type=dash|[/?&]format=dash/i;
+
+    function isWatermarkedVideoUrl(value) {
+        const text = String(value || '');
+        if (!text) {
+            return false;
+        }
+
+        if (WATERMARK_URL_PATTERN.test(text)) {
+            return true;
+        }
+
+        try {
+            return WATERMARK_URL_PATTERN.test(decodeURIComponent(text));
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function isCleanPlayEndpointUrl(value) {
+        return CLEAN_PLAY_ENDPOINT_PATTERN.test(String(value || ''));
+    }
+
+    function isDashStreamUrl(value) {
+        return DASH_STREAM_PATTERN.test(String(value || ''));
+    }
+
     function looksLikeVideoUrl(key, value) {
         if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) {
             return false;
@@ -3232,12 +3654,19 @@
             score -= 300;
         }
 
+        // v0.2.3: `download_addr` / `downloadUrl` are the watermarked copies on Douyin. The old
+        // scorer gave them +90 ("download" bonus) while a clean play link got 0, so the watermarked
+        // stream won almost every time it existed. Demote them hard instead.
         if (loweredKey.includes('download')) {
-            score += 90;
+            score -= 260;
         }
 
         if (loweredKey.includes('play')) {
-            score += 70;
+            score += 90;
+        }
+
+        if (loweredKey.includes('bit_rate') || loweredKey.includes('bitrate') || loweredKey.includes('gear')) {
+            score += 30;
         }
 
         if (loweredKey.includes('url') || loweredKey.includes('src')) {
@@ -3260,8 +3689,18 @@
             score += 25;
         }
 
-        if (loweredValue.includes('playwm')) {
-            score -= 40;
+        // Clean, server-signed play endpoint: always beats a raw watermarked CDN link.
+        if (isCleanPlayEndpointUrl(value)) {
+            score += 260;
+        }
+
+        if (isDashStreamUrl(value)) {
+            score -= 800;
+        }
+
+        // Hard demotion: a watermark can only be avoided by picking another candidate.
+        if (isWatermarkedVideoUrl(value)) {
+            score -= 1400;
         }
 
         return score;
@@ -3313,7 +3752,11 @@
         return bestValue;
     }
 
-    function collectStructuredUrlCandidates(value, bucket, key = 'url') {
+    // v0.2.3: the scoring key is now the whole field *path* (e.g. `video.download_addr.url_list`)
+    // instead of the last key only (`url_list`). Without the path, `play_addr` and `download_addr`
+    // both scored as "url_list" and the watermarked one was picked whenever it happened to look more
+    // like a direct CDN mp4. The leaf key is still used for the audio/cover filters.
+    function collectStructuredUrlCandidates(value, bucket, key = 'url', path = '') {
         if (!value) {
             return;
         }
@@ -3322,9 +3765,11 @@
             return;
         }
 
+        const currentPath = path || key;
+
         if (Array.isArray(value)) {
             for (const item of value) {
-                collectStructuredUrlCandidates(item, bucket, key);
+                collectStructuredUrlCandidates(item, bucket, key, currentPath);
             }
             return;
         }
@@ -3333,7 +3778,8 @@
             if (looksLikeVideoUrl(key, value)) {
                 bucket.push({
                     value,
-                    score: scoreVideoUrl(key, value),
+                    field: currentPath,
+                    score: scoreVideoUrl(currentPath, value),
                 });
             }
             return;
@@ -3344,7 +3790,25 @@
         }
 
         for (const [childKey, childValue] of Object.entries(value)) {
-            collectStructuredUrlCandidates(childValue, bucket, childKey);
+            collectStructuredUrlCandidates(childValue, bucket, childKey, `${currentPath}.${childKey}`);
+        }
+    }
+
+    // Field-level bonus on top of the URL-shape score: on Douyin `play_addr` / `bit_rate[].play_addr`
+    // are the clean streams and `download_addr` is the watermarked copy.
+    function collectStructuredUrlsWithFieldBonus(value, bucket, fieldLabel, bonus = 0) {
+        if (!value) {
+            return;
+        }
+
+        const localBucket = [];
+        collectStructuredUrlCandidates(value, localBucket, fieldLabel);
+
+        for (const item of localBucket) {
+            bucket.push({
+                ...item,
+                score: item.score + bonus,
+            });
         }
     }
 
@@ -3440,17 +3904,23 @@
             normalizeVideoId(authorSource.aweme_id),
         ].filter(Boolean);
 
+        // v0.2.3: clean fields get a bonus, watermarked `download*` fields are pushed to the back.
         const urlCandidates = [];
-        collectStructuredUrlCandidates(node.play_addr, urlCandidates, 'play_addr');
-        collectStructuredUrlCandidates(node.playAddr, urlCandidates, 'playAddr');
-        collectStructuredUrlCandidates(node.download_addr, urlCandidates, 'download_addr');
-        collectStructuredUrlCandidates(node.downloadAddr, urlCandidates, 'downloadAddr');
-        collectStructuredUrlCandidates(node.play_url, urlCandidates, 'play_url');
-        collectStructuredUrlCandidates(node.playUrl, urlCandidates, 'playUrl');
-        collectStructuredUrlCandidates(node.download_url, urlCandidates, 'download_url');
-        collectStructuredUrlCandidates(node.downloadUrl, urlCandidates, 'downloadUrl');
-        collectStructuredUrlCandidates(node.video, urlCandidates, 'video');
-        collectStructuredUrlCandidates(node.media, urlCandidates, 'media');
+        collectStructuredUrlsWithFieldBonus(node.play_addr, urlCandidates, 'play_addr', 160);
+        collectStructuredUrlsWithFieldBonus(node.playAddr, urlCandidates, 'playAddr', 160);
+        collectStructuredUrlsWithFieldBonus(node.play_addr_h264, urlCandidates, 'play_addr_h264', 150);
+        collectStructuredUrlsWithFieldBonus(node.play_addr_265, urlCandidates, 'play_addr_265', 150);
+        collectStructuredUrlsWithFieldBonus(node.play_addr_bytevc1, urlCandidates, 'play_addr_bytevc1', 150);
+        collectStructuredUrlsWithFieldBonus(node.bit_rate, urlCandidates, 'bit_rate', 240);
+        collectStructuredUrlsWithFieldBonus(node.bitRate, urlCandidates, 'bitRate', 240);
+        collectStructuredUrlsWithFieldBonus(node.play_url, urlCandidates, 'play_url', 140);
+        collectStructuredUrlsWithFieldBonus(node.playUrl, urlCandidates, 'playUrl', 140);
+        collectStructuredUrlsWithFieldBonus(node.download_addr, urlCandidates, 'download_addr', -420);
+        collectStructuredUrlsWithFieldBonus(node.downloadAddr, urlCandidates, 'downloadAddr', -420);
+        collectStructuredUrlsWithFieldBonus(node.download_url, urlCandidates, 'download_url', -420);
+        collectStructuredUrlsWithFieldBonus(node.downloadUrl, urlCandidates, 'downloadUrl', -420);
+        collectStructuredUrlsWithFieldBonus(node.video, urlCandidates, 'video');
+        collectStructuredUrlsWithFieldBonus(node.media, urlCandidates, 'media');
 
         const title = pickBestCandidate(titleCandidates, scoreTitleCandidate);
         const author = pickBestCandidate(authorCandidates, scoreAuthorCandidate);
@@ -4422,10 +4892,15 @@
 
             setPrimaryButtonState('开始下载', true, 'single');
             setStatus(`开始下载:\n${entry.meta.title}`);
+            // v0.2.3: clean links are tried first; a watermarked link is only used when nothing else
+            // resolves. (Sort is stable, so the resolver's own order is preserved otherwise.)
             const candidateUrls = Array.from(new Set([
                 entry.videoUrl,
                 ...(Array.isArray(entry.alternateUrls) ? entry.alternateUrls : []),
-            ].filter(Boolean)));
+            ].filter(Boolean)))
+                .filter((url) => isDirectHttpVideoUrl(url) || String(url).startsWith('blob:'))
+                .sort((left, right) => Number(isWatermarkedVideoUrl(left)) - Number(isWatermarkedVideoUrl(right)));
+            const onlyWatermarkedSource = candidateUrls.length > 0 && candidateUrls.every(isWatermarkedVideoUrl);
             let lastDownloadError = null;
 
             for (let index = 0; index < candidateUrls.length; index += 1) {
@@ -4447,7 +4922,9 @@
                 throw lastDownloadError;
             }
 
-            setStatus(`已保存:\n${filename}`);
+            setStatus(onlyWatermarkedSource
+                ? `已保存(该视频仅提供带水印源):\n${filename}`
+                : `已保存:\n${filename}`);
         } catch (error) {
             console.error('[Douyin Downloader Pro] Download failed.', error);
             setStatus(`下载失败:\n${error.message}`);
@@ -4986,6 +5463,9 @@
     }
 
     function boot() {
+        // Must run before anything touches the DOM: the page-world hooks have to be in place before
+        // Douyin fires its own aweme/feed requests (this script runs at document-start).
+        installPageBridge();
         installNetworkHooks();
         installResourceHooks();
 
@@ -5007,6 +5487,7 @@
         });
         patchHistory();
         installObservers();
+        requestPageGlobals();
         scheduleRefresh(0);
 
         console.log('[Douyin Downloader Pro] 就绪。按 Q 键或点击悬浮下载按钮。');
