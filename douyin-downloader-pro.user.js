@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.5
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址。自动更新源为本仓库 GitHub。
+// @version      0.2.6
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址；0.2.6 修正视频页文件名取错推荐视频标题的问题。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -42,6 +42,10 @@
 //     without a signature. The page-world side now scrapes `player.config` (url / definition.extraList
 //     / awemeInfo.video.playApi) into an `aweme_detail`-shaped snapshot, so those videos resolve to the
 //     clean `aweme/v1/play` endpoint instead of failing with "未找到可下载地址".
+//   - Title fix (v0.2.6): on `/video/<id>` pages the recommendation rail also exposes titles and
+//     `<video>` nodes, so the DOM heuristics could name the file after a neighbouring clip. The
+//     page's own `<title>` and the bridge's `aweme_id`/`desc`/`author` now win; an immediate repeat
+//     download of the same filename is skipped instead of saving " (1)" copies.
 // Update source: this GitHub repo (raw.githubusercontent.com). Tampermonkey checks @updateURL
 // periodically; bump @version on every release so the auto-update actually triggers.
 // ==/UserScript==
@@ -122,6 +126,8 @@
         pageBridgeError: '',
         pageGlobals: Object.create(null),
         lastPlayerSnapshot: '',
+        lastDownloadFilename: '',
+        lastDownloadAt: 0,
     };
 
     const titleSelectors = [
@@ -1483,12 +1489,19 @@
             const awemeInfo = config.awemeInfo || {};
             const rawId = awemeInfo.aweme_id || config.vid || config.uri || '';
             const videoId = String(rawId).split('?')[0].replace(/^v/, '');
+            const author = awemeInfo.author || null;
 
             try {
                 return JSON.stringify({
                     aweme_detail: {
                         aweme_id: videoId,
                         desc: String(awemeInfo.desc || document.title || ''),
+                        author: author
+                            ? {
+                                  nickname: author.nickname || '',
+                                  unique_id: author.unique_id || '',
+                              }
+                            : null,
                         video: {
                             duration: Number(config.duration) || 0,
                             play_addr: { url_list: cleanUrls },
@@ -2175,6 +2188,42 @@
         return bestText;
     }
 
+    // v0.2.6: on a `/video/<id>` page the recommendation rail also renders `[class*="title"]`,
+    // `[data-e2e="video-desc"]` and `<video>` elements, so the DOM heuristics could pick a
+    // neighbouring clip and name the file after the wrong video. Prefer the page's own <title>
+    // there, and fall back to the aweme metadata the page-world bridge reports for the player.
+    function getOwnVideoPageTitle() {
+        if (!normalizeVideoPageUrl(location.href)) {
+            return '';
+        }
+
+        const raw = normalizeText(document.title)
+            .replace(/\s*-\s*抖音$/i, '')
+            .replace(/\s*-\s*Douyin$/i, '')
+            .trim();
+
+        if (!raw || isGenericTitleText(raw) || isLikelyUiText(raw)) {
+            return '';
+        }
+
+        return raw;
+    }
+
+    function getBridgedAwemeMeta() {
+        const pageVideoId = normalizeVideoId(extractVideoId(location.href));
+        if (!pageVideoId) {
+            return { title: '', author: '' };
+        }
+
+        const record = getStructuredVideoRecord(pageVideoId, '');
+        const meta = (record && record.meta) || {};
+
+        return {
+            title: sanitizeFilenamePart(meta.title || '', ''),
+            author: sanitizeFilenamePart(meta.author || '', ''),
+        };
+    }
+
     function extractMetaFromVideo(video) {
         const roots = collectRoots(video);
         const title = pickText(roots, titleSelectors, (text) => {
@@ -2193,9 +2242,12 @@
             return true;
         }) || pickNearbyText(roots.filter((root) => root !== document), scoreAuthorCandidate);
 
+        const ownTitle = getOwnVideoPageTitle();
+        const bridged = getBridgedAwemeMeta();
+
         return {
-            title: sanitizeFilenamePart(title, TITLE_FALLBACK),
-            author: sanitizeFilenamePart(author, AUTHOR_FALLBACK),
+            title: sanitizeFilenamePart(ownTitle || bridged.title || title, TITLE_FALLBACK),
+            author: sanitizeFilenamePart(bridged.author || author, AUTHOR_FALLBACK),
         };
     }
 
@@ -5057,6 +5109,15 @@
             const entry = await resolveCurrentVideoEntry();
             const filename = buildFilename(entry.meta);
 
+            // v0.2.6: a double click used to save the same clip twice (the browser uniquifies the
+            // name with " (1)"). Skip an immediate repeat instead of silently duplicating the file.
+            const nowMs = Date.now();
+            if (filename && filename === state.lastDownloadFilename && (nowMs - state.lastDownloadAt) < 4000) {
+                setStatus(`刚刚已经保存过同一个视频,跳过重复下载:\n${filename}`);
+                finishAction();
+                return;
+            }
+
             const updateSingleDownloadProgress = (progress) => {
                 const progressText = formatDownloadProgress(progress?.loaded || 0, progress?.total || 0);
                 const percent = progress?.total
@@ -5093,6 +5154,8 @@
 
                     await downloadVideoUrl(candidateUrls[index], filename, updateSingleDownloadProgress);
                     lastDownloadError = null;
+                    state.lastDownloadFilename = filename;
+                    state.lastDownloadAt = Date.now();
                     break;
                 } catch (error) {
                     lastDownloadError = error;
