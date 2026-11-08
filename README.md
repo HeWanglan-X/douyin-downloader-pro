@@ -64,6 +64,7 @@
 
 | 版本 | 内容 |
 |---|---|
+| **v0.2.5** | 支持 MSE（`blob:`）播放页：有些视频走 Media Source Extensions，`<video>` 只有 `blob:` 地址、DOM 里没有 http 链接，同源 `aweme/detail` 又要签名。页面世界现在从 `player.config`（`url` / `definition.extraList` / `awemeInfo.video.playApi`）抓出可下载地址，并优先使用带 `biz_sign` 的 `/aweme/v1/play/` 渐进流（音视频齐全），`media-video` 分片与 DASH 一律降权。 |
 | **v0.2.4** | 适配 Manifest V3：新增页面世界抓包桥（注入 `<script>`，nonce 感知，postMessage 回传），修复 Chrome/Edge MV3 沙盒下 `fetch` / XHR 补丁抓不到 aweme 响应、点了按钮没反应的问题；页面全局数据（`_ROUTER_DATA` / `player`）同样走桥接快照；CSP 拦截时静默回落到同源 `aweme/detail` 接口。 |
 | **v0.2.3** | 无水印选源：`download_addr` / `config.downloadUrl` 权重由 +420 降到 -460，水印 URL（`watermark=1` / `logo_name=` / `/playwm/`）排到候选末尾，优先 `play_addr` / `bit_rate[].play_addr` 干净流。 |
 | **v0.2.2** | 界面汉化：悬浮按钮、状态提示、批量下载弹窗（标题/按钮/搜索框/列表/统计/错误提示）全部改为简体中文；下载进度与结果提示同步汉化。 |

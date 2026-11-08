@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.4
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据。自动更新源为本仓库 GitHub。
+// @version      0.2.5
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -37,6 +37,11 @@
 //     A tiny page-world bridge (injected <script>, nonce-aware) now installs the same hooks inside
 //     the page context and relays captured JSON plus `_ROUTER_DATA` / `RENDER_DATA` / `player`
 //     snapshots back over `postMessage`. Falls back silently when a CSP blocks the injection.
+//   - MSE fix (v0.2.5): some clips play through Media Source Extensions, so `<video>` only exposes
+//     `blob:` and the DOM holds no http media link, while `/aweme/v1/web/aweme/detail/` answers 403
+//     without a signature. The page-world side now scrapes `player.config` (url / definition.extraList
+//     / awemeInfo.video.playApi) into an `aweme_detail`-shaped snapshot, so those videos resolve to the
+//     clean `aweme/v1/play` endpoint instead of failing with "未找到可下载地址".
 // Update source: this GitHub repo (raw.githubusercontent.com). Tampermonkey checks @updateURL
 // periodically; bump @version on every release so the auto-update actually triggers.
 // ==/UserScript==
@@ -116,6 +121,7 @@
         pageBridgeChannel: '',
         pageBridgeError: '',
         pageGlobals: Object.create(null),
+        lastPlayerSnapshot: '',
     };
 
     const titleSelectors = [
@@ -1399,6 +1405,103 @@
             }
         }
 
+        // v0.2.5: some videos play through Media Source Extensions, so `<video>` only carries a
+        // `blob:` URL and the DOM has no http media link at all. The only usable sources live on
+        // `player.config` — which cannot be JSON-serialized (React fiber refs + event emitters), so
+        // scrape the media URLs there and hand the userscript an `aweme_detail`-shaped payload it
+        // already knows how to score.
+        function buildPlayerSnapshot() {
+            const player = window.player;
+            const config = player && player.config;
+            if (!config) {
+                return '';
+            }
+
+            const cleanUrls = [];
+            const downloadUrls = [];
+            const seen = {};
+
+            const push = (bucket, value) => {
+                if (typeof value !== 'string' || value.length < 12 || seen[value]) {
+                    return;
+                }
+                if (!/^https?:\/\//i.test(value)) {
+                    return;
+                }
+                seen[value] = true;
+                bucket.push(value);
+            };
+
+            const pushGroup = (bucket, group) => {
+                if (!Array.isArray(group)) {
+                    return;
+                }
+                for (const item of group) {
+                    if (!item) {
+                        continue;
+                    }
+                    push(bucket, item.src || item.url || item.main_url || item.backup_url);
+                }
+            };
+
+            try {
+                pushGroup(cleanUrls, config.url);
+
+                const extraList = (config.definition && config.definition.extraList) || [];
+                for (const definition of extraList) {
+                    if (!definition) {
+                        continue;
+                    }
+                    pushGroup(cleanUrls, definition.url);
+                    push(cleanUrls, definition.main_url);
+                }
+
+                const awemeInfo = config.awemeInfo || null;
+                const awemeVideo = (awemeInfo && awemeInfo.video) || null;
+                if (awemeVideo) {
+                    push(cleanUrls, awemeVideo.playApi);
+                    push(cleanUrls, awemeVideo.playApiH265);
+                    push(cleanUrls, awemeVideo.playApiH264);
+                    pushGroup(cleanUrls, awemeVideo.play_addr && awemeVideo.play_addr.url_list);
+                    for (const rate of (awemeVideo.bit_rate || [])) {
+                        pushGroup(cleanUrls, rate && rate.play_addr && rate.play_addr.url_list);
+                    }
+                    push(downloadUrls, awemeVideo.download && awemeVideo.download.url);
+                    pushGroup(downloadUrls, awemeVideo.download_addr && awemeVideo.download_addr.url_list);
+                }
+
+                push(cleanUrls, config.videoUrl);
+                push(cleanUrls, config.downgradeUrl);
+            } catch (error) {
+                // keep whatever was collected before the failure
+            }
+
+            if (!cleanUrls.length && !downloadUrls.length) {
+                return '';
+            }
+
+            const awemeInfo = config.awemeInfo || {};
+            const rawId = awemeInfo.aweme_id || config.vid || config.uri || '';
+            const videoId = String(rawId).split('?')[0].replace(/^v/, '');
+
+            try {
+                return JSON.stringify({
+                    aweme_detail: {
+                        aweme_id: videoId,
+                        desc: String(awemeInfo.desc || document.title || ''),
+                        video: {
+                            duration: Number(config.duration) || 0,
+                            play_addr: { url_list: cleanUrls },
+                            download_addr: { url_list: downloadUrls },
+                        },
+                    },
+                    __source: 'player.config',
+                });
+            } catch (error) {
+                return '';
+            }
+        }
+
         function dumpGlobals() {
             const payload = {};
 
@@ -1413,6 +1516,15 @@
                 } catch (error) {
                     // ignore circular / unreadable globals
                 }
+            }
+
+            try {
+                const playerSnapshot = buildPlayerSnapshot();
+                if (playerSnapshot) {
+                    payload.__PLAYER_SNAPSHOT__ = playerSnapshot;
+                }
+            } catch (error) {
+                // ignore
             }
 
             if (Object.keys(payload).length) {
@@ -1438,9 +1550,39 @@
             if (data.type === 'dump') {
                 dumpGlobals();
             }
+
+            if (data.type === 'dumpPlayer') {
+                try {
+                    const snapshot = buildPlayerSnapshot();
+                    if (snapshot) {
+                        post('player', snapshot);
+                    }
+                } catch (error) {
+                    // ignore
+                }
+            }
         }, false);
 
         dumpGlobals();
+
+        // The page player object only exists once the player bundle boots, so poll for a bit.
+        let playerTicks = 0;
+        const playerTimer = window.setInterval(() => {
+            playerTicks += 1;
+
+            try {
+                const snapshot = buildPlayerSnapshot();
+                if (snapshot) {
+                    post('player', snapshot);
+                }
+            } catch (error) {
+                // ignore
+            }
+
+            if (playerTicks >= 40) {
+                window.clearInterval(playerTimer);
+            }
+        }, 2500);
     }
 
     function buildPageBridgeCode(channel) {
@@ -1471,6 +1613,23 @@
         return objects;
     }
 
+    // v0.2.5: feed the `player.config` snapshot (built in the page world) through the same JSON
+    // parser the network capture uses, so MSE/blob pages still resolve a real media URL.
+    function applyPlayerSnapshot(text) {
+        if (typeof text !== 'string' || text.length < 40 || text === state.lastPlayerSnapshot) {
+            return;
+        }
+
+        state.lastPlayerSnapshot = text;
+
+        const before = state.videoDataRecords.length;
+        maybeCacheStructuredDataResponse(text);
+
+        if (state.videoDataRecords.length !== before && document.body) {
+            scheduleRefresh();
+        }
+    }
+
     function handlePageBridgeMessage(event) {
         const data = event && event.data;
         if (!data || typeof data !== 'object') {
@@ -1490,11 +1649,21 @@
             return;
         }
 
+        if (data.type === 'player') {
+            applyPlayerSnapshot(data.payload);
+            return;
+        }
+
         if (data.type === 'globals') {
             let received = false;
 
             for (const [name, text] of Object.entries(data.payload || {})) {
                 if (typeof text !== 'string' || !text) {
+                    continue;
+                }
+
+                if (name === '__PLAYER_SNAPSHOT__') {
+                    applyPlayerSnapshot(text);
                     continue;
                 }
 
@@ -1519,6 +1688,12 @@
                 source: PAGE_BRIDGE_HOST_SOURCE,
                 channel: state.pageBridgeChannel,
                 type: 'dump',
+            }, '*');
+
+            window.postMessage({
+                source: PAGE_BRIDGE_HOST_SOURCE,
+                channel: state.pageBridgeChannel,
+                type: 'dumpPlayer',
             }, '*');
         } catch (error) {
             // ignore
@@ -3692,6 +3867,13 @@
         // Clean, server-signed play endpoint: always beats a raw watermarked CDN link.
         if (isCleanPlayEndpointUrl(value)) {
             score += 260;
+        }
+
+        // v0.2.5: `/aweme/v1/play/?...&biz_sign=...` is the progressive stream (audio + video) that
+        // MSE pages hide behind `blob:`. It must outrank the `media-video` segments, which only carry
+        // the video track.
+        if (/\/aweme\/v1\/play\/?\?[^#]*\bbiz_sign=/i.test(value) && !isDashStreamUrl(value)) {
+            score += 420;
         }
 
         if (isDashStreamUrl(value)) {
