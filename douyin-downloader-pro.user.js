@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音视频下载 Pro（Douyin Downloader Pro）
 // @namespace    https://github.com/HeWanglan-X
-// @version      0.2.7
-// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址；0.2.6 修正视频页文件名取错推荐视频标题的问题；0.2.7 下载提速：多镜像测速 + 6 路分片并发。自动更新源为本仓库 GitHub。
+// @version      0.2.8
+// @description  官方版（v1.7.50）分叉增强版：修复悬浮下载按钮透明区域拦截鼠标点击的问题；可替代官方版独立使用，快捷键与官方一致（Q）；批量下载界面已汉化；0.2.3 起优先取无水印源（play_addr / bit_rate），不再误用 download_addr 与水印 CDN 链接；0.2.4 起适配 Manifest V3：注入页面世界抓包桥，Chrome/Edge MV3 沙盒下也能读到 aweme 响应与页面全局数据；0.2.5 起支持 MSE（blob）播放页，从 player.config 解析可下载地址；0.2.6 修正视频页文件名取错推荐视频标题的问题；0.2.7 下载提速：多镜像测速 + 6 路分片并发；0.2.8 修复长视频偶发下载失败（分片校验+重试+回落）与文件名不跟随当前视频的问题。自动更新源为本仓库 GitHub。
 // @author       HeWanglan-X
 // @match        *://*.douyin.com/*
 // @match        *://douyin.com/*
@@ -42,6 +42,11 @@
 //     without a signature. The page-world side now scrapes `player.config` (url / definition.extraList
 //     / awemeInfo.video.playApi) into an `aweme_detail`-shaped snapshot, so those videos resolve to the
 //     clean `aweme/v1/play` endpoint instead of failing with "未找到可下载地址".
+//   - Robustness (v0.2.8): long clips failed intermittently because one bad chunk killed the whole
+//     range download and a server answering 200 (ignoring `Range`) produced a corrupt blob. Every
+//     chunk is now validated (status 206, `content-range` start, exact byte count), retried twice,
+//     and any persistent problem falls back to a plain single stream. Range mode is skipped above
+//     400 MB so huge files stay on the native download path.
 //   - Speed (v0.2.7): the plain CDN hosts throttle per connection (measured 2.5-4 MB/s single
 //     stream here) while the signed `/aweme/v1/play/` endpoint redirects to a fast edge (~9-11 MB/s).
 //     The script now probes the first candidates (256 KB range), puts reachable/faster mirrors first,
@@ -134,6 +139,7 @@
         lastDownloadFilename: '',
         lastDownloadAt: 0,
         mediaProbeCache: new Map(),
+        lastAwemeMeta: null,
     };
 
     const titleSelectors = [
@@ -1641,6 +1647,24 @@
 
         state.lastPlayerSnapshot = text;
 
+        // v0.2.8: keep the newest player/aweme identity around. The page's own <title> can lag behind
+        // SPA feed navigation (that is what produced 20+ files with the same, wrong name).
+        try {
+            const parsedSnapshot = JSON.parse(text);
+            const detail = parsedSnapshot && parsedSnapshot.aweme_detail;
+            if (detail) {
+                state.lastAwemeMeta = {
+                    id: String(detail.aweme_id || ''),
+                    title: String(detail.desc || ''),
+                    author: String(
+                        (detail.author && (detail.author.nickname || detail.author.unique_id)) || ''
+                    ),
+                };
+            }
+        } catch (error) {
+            // ignore malformed snapshots
+        }
+
         const before = state.videoDataRecords.length;
         maybeCacheStructuredDataResponse(text);
 
@@ -2217,17 +2241,32 @@
 
     function getBridgedAwemeMeta() {
         const pageVideoId = normalizeVideoId(extractVideoId(location.href));
-        if (!pageVideoId) {
-            return { title: '', author: '' };
+
+        if (pageVideoId) {
+            const record = getStructuredVideoRecord(pageVideoId, '');
+            const meta = (record && record.meta) || {};
+
+            if (meta.title || meta.author) {
+                return {
+                    title: sanitizeFilenamePart(meta.title || '', ''),
+                    author: sanitizeFilenamePart(meta.author || '', ''),
+                };
+            }
         }
 
-        const record = getStructuredVideoRecord(pageVideoId, '');
-        const meta = (record && record.meta) || {};
+        const latest = state.lastAwemeMeta || null;
+        const latestId = latest ? normalizeVideoId(latest.id) : '';
 
-        return {
-            title: sanitizeFilenamePart(meta.title || '', ''),
-            author: sanitizeFilenamePart(meta.author || '', ''),
-        };
+        // Only trust the newest snapshot when it belongs to this page (or when the URL carries no id,
+        // e.g. the recommend feed, where the player is still the source of truth).
+        if (latest && (!pageVideoId || !latestId || latestId === pageVideoId)) {
+            return {
+                title: sanitizeFilenamePart(latest.title || '', ''),
+                author: sanitizeFilenamePart(latest.author || '', ''),
+            };
+        }
+
+        return { title: '', author: '' };
     }
 
     function extractMetaFromVideo(video) {
@@ -2252,8 +2291,37 @@
         const bridged = getBridgedAwemeMeta();
 
         return {
-            title: sanitizeFilenamePart(ownTitle || bridged.title || title, TITLE_FALLBACK),
+            title: sanitizeFilenamePart(bridged.title || ownTitle || title, TITLE_FALLBACK),
             author: sanitizeFilenamePart(bridged.author || author, AUTHOR_FALLBACK),
+        };
+    }
+
+    // v0.2.8: the file name must describe the clip that was actually resolved, so prefer the meta of
+    // the record the resolver used, then the live player snapshot, and only then the page <title>
+    // (which can be stale) or the DOM heuristics.
+    function pickBestEntryMeta(entry) {
+        const base = (entry && entry.meta) || {};
+        const entryVideoId = normalizeVideoId((entry && entry.videoId) || '');
+        const record = entryVideoId ? getStructuredVideoRecord(entryVideoId, '') : null;
+        const recordMeta = (record && record.meta) || {};
+        const bridged = getBridgedAwemeMeta();
+        const latest = state.lastAwemeMeta || {};
+
+        const title = recordMeta.title
+            || bridged.title
+            || latest.title
+            || getOwnVideoPageTitle()
+            || base.title
+            || '';
+        const author = recordMeta.author
+            || bridged.author
+            || latest.author
+            || base.author
+            || '';
+
+        return {
+            title: sanitizeFilenamePart(title, TITLE_FALLBACK),
+            author: sanitizeFilenamePart(author, AUTHOR_FALLBACK),
         };
     }
 
@@ -3053,6 +3121,9 @@
     const RANGE_MIN_BYTES = 2 * 1024 * 1024;
     const RANGE_CONCURRENCY = 6;
     const RANGE_MIN_CHUNK = 512 * 1024;
+    const RANGE_MAX_CHUNK = 16 * 1024 * 1024;
+    const RANGE_MAX_BYTES = 400 * 1024 * 1024;
+    const RANGE_CHUNK_RETRIES = 2;
 
     async function probeMediaUrl(url) {
         if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
@@ -3140,27 +3211,93 @@
         return ordered.concat(tail);
     }
 
+    // v0.2.8: long videos used to fail intermittently because a single bad chunk killed the whole
+    // range download, and a server ignoring `Range` (200 instead of 206) silently produced a corrupt
+    // blob. Chunks are now validated (status, content-range, byte count), retried individually, and
+    // any persistent problem throws so the caller can fall back to a plain single stream.
     async function downloadByRanges(url, filename, onProgress, totalBytes) {
         const total = Number(totalBytes) || 0;
         if (!total) {
             throw new Error('无法确定文件大小');
         }
 
+        if (total > RANGE_MAX_BYTES) {
+            throw new Error(`文件过大(${formatByteSize(total)}),改用单流下载`);
+        }
+
         const concurrency = Math.max(2, Math.min(
             RANGE_CONCURRENCY,
             Math.ceil(total / RANGE_MIN_CHUNK)
         ));
-        const chunkSize = Math.ceil(total / concurrency);
+        const chunkSize = Math.min(RANGE_MAX_CHUNK, Math.ceil(total / concurrency));
         const parts = new Array(concurrency);
         let loaded = 0;
 
         const report = () => {
             if (typeof onProgress === 'function') {
-                onProgress({ phase: 'downloading', loaded, total });
+                onProgress({ phase: 'downloading', loaded: Math.min(loaded, total), total });
             }
         };
 
         report();
+
+        const fetchChunk = async (start, end) => {
+            const expected = end - start + 1;
+            const response = await fetch(url, {
+                headers: { Range: `bytes=${start}-${end}` },
+                credentials: 'include',
+            });
+
+            if (response.status !== 206) {
+                throw new Error(`分片请求未返回 206(HTTP ${response.status})`);
+            }
+
+            const contentRange = response.headers.get('content-range') || '';
+            const rangeMatch = contentRange.match(/bytes\s+(\d+)-(\d+)\/(\d+)/i);
+            if (!rangeMatch || Number(rangeMatch[1]) !== start) {
+                throw new Error(`分片范围不匹配:${contentRange || '空'}`);
+            }
+
+            const reader = response.body && typeof response.body.getReader === 'function'
+                ? response.body.getReader()
+                : null;
+
+            let received = 0;
+            let buffer;
+
+            if (!reader) {
+                buffer = new Uint8Array(await response.arrayBuffer());
+                received = buffer.byteLength;
+                loaded += received;
+                report();
+            } else {
+                const chunks = [];
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+
+                    if (value) {
+                        chunks.push(value);
+                        received += value.byteLength;
+                        loaded += value.byteLength;
+                        report();
+                    }
+                }
+
+                buffer = new Blob(chunks);
+            }
+
+            if (received !== expected) {
+                // Roll the partial progress back so the retry does not inflate the percentage.
+                loaded -= received;
+                report();
+                throw new Error(`分片字节数不符:期望 ${expected},实际 ${received}`);
+            }
+
+            return buffer;
+        };
 
         let nextIndex = 0;
         const worker = async () => {
@@ -3178,42 +3315,29 @@
                     return;
                 }
 
-                const response = await fetch(url, {
-                    headers: { Range: `bytes=${start}-${end}` },
-                    credentials: 'include',
-                });
+                let lastError = null;
 
-                if (!response.ok && response.status !== 206) {
-                    throw new Error(`分片请求失败,HTTP ${response.status}`);
-                }
-
-                const reader = response.body && typeof response.body.getReader === 'function'
-                    ? response.body.getReader()
-                    : null;
-
-                if (!reader) {
-                    const buffer = await response.arrayBuffer();
-                    parts[index] = buffer;
-                    loaded += buffer.byteLength;
-                    report();
-                    continue;
-                }
-
-                const chunks = [];
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
+                for (let attempt = 0; attempt <= RANGE_CHUNK_RETRIES; attempt += 1) {
+                    try {
+                        parts[index] = await fetchChunk(start, end);
+                        lastError = null;
                         break;
-                    }
+                    } catch (error) {
+                        lastError = error;
+                        console.warn(
+                            `[Douyin Downloader Pro] 分片 ${index + 1}/${concurrency} 第 ${attempt + 1} 次失败`,
+                            error
+                        );
 
-                    if (value) {
-                        chunks.push(value);
-                        loaded += value.byteLength;
-                        report();
+                        if (attempt < RANGE_CHUNK_RETRIES) {
+                            await wait(250 * (attempt + 1));
+                        }
                     }
                 }
 
-                parts[index] = new Blob(chunks);
+                if (lastError) {
+                    throw lastError;
+                }
             }
         };
 
@@ -3222,6 +3346,10 @@
         const blob = new Blob(parts.filter(Boolean), { type: 'video/mp4' });
         if (!blob.size) {
             throw new Error('分片下载结果为空');
+        }
+
+        if (blob.size !== total) {
+            console.warn(`[Douyin Downloader Pro] 分片合并大小异常:${blob.size} != ${total}`);
         }
 
         if (typeof onProgress === 'function') {
@@ -5317,7 +5445,7 @@
 
         try {
             const entry = await resolveCurrentVideoEntry();
-            const filename = buildFilename(entry.meta);
+            const filename = buildFilename(pickBestEntryMeta(entry));
 
             // v0.2.6: a double click used to save the same clip twice (the browser uniquifies the
             // name with " (1)"). Skip an immediate repeat instead of silently duplicating the file.

@@ -64,6 +64,7 @@
 
 | 版本 | 内容 |
 |---|---|
+| **v0.2.8** | 修复两个问题：① 文件名不跟随当前视频/整批同名 —— 改为优先取「本次解析到的记录」的标题与作者，其次取播放器快照（`player.config.awemeInfo`），最后才用 `<title>`/DOM（SPA 切换视频时 `document.title` 会滞后）；② 长视频偶发下载失败 —— 分片下载现在校验 HTTP 206、`content-range` 起点与字节数，单片失败自动重试 2 次，持续失败则回落单流，超过 400 MB 直接走单流，不再拼出损坏文件。 |
 | **v0.2.7** | 下载提速：下载前对前 3 个候选各做 256 KB Range 探测，过期/不可用镜像排最后、可用镜像按实测速度排序；服务端支持 Range 且文件 ≥2 MB 时走 6 路分片并发（实测被限速的 CDN 镜像 4→20 MB/s，签名 play 端点 10→14 MB/s），失败自动回落单流；进度条显示实时 MB/s；批量间隔 700→200 ms。 |
 | **v0.2.6** | 修正视频页文件名：`/video/<id>` 页右侧推荐列表也带标题与 `<video>`，DOM 启发式会把文件名取成别的视频。现在优先用页面自带 `<title>` 与 player 的 `aweme_id` / `desc` / `author`；同一文件名 4 秒内重复点击不再生成 ` (1)` 副本。 |
 | **v0.2.5** | 支持 MSE（`blob:`）播放页：有些视频走 Media Source Extensions，`<video>` 只有 `blob:` 地址、DOM 里没有 http 链接，同源 `aweme/detail` 又要签名。页面世界现在从 `player.config`（`url` / `definition.extraList` / `awemeInfo.video.playApi`）抓出可下载地址，并优先使用带 `biz_sign` 的 `/aweme/v1/play/` 渐进流（音视频齐全），`media-video` 分片与 DASH 一律降权。 |
